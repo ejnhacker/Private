@@ -1,4 +1,5 @@
 import os
+import asyncio
 import requests
 import pandas as pd
 import numpy as np
@@ -6,26 +7,24 @@ from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from sklearn.preprocessing import MinMaxScaler
 from telegram import Bot
+from telegram.error import TelegramError
 import time
 from datetime import datetime
 import pickle
-
-# ======================
-# 1. CONFIGURATION (FROM .ENV)
-# ======================
-# Add this near other imports
 from dotenv import load_dotenv
-load_dotenv()  # Load .env or Replit secrets
 
-# Modify the configuration section to:
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN') or os.environ['TELEGRAM_TOKEN']
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID') or os.environ['TELEGRAM_CHAT_ID']
-TWELVEDATA_API_KEY = os.getenv('TWELVEDATA_API_KEY') or os.environ['TWELVEDATA_API_KEY']
+# ======================
+# 1. CONFIGURATION
+# ======================
+load_dotenv()
 
-# Customizable from .env (comma-separated)
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN') or os.environ.get('TELEGRAM_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID') or os.environ.get('TELEGRAM_CHAT_ID')
+TWELVEDATA_API_KEY = os.getenv('TWELVEDATA_API_KEY') or os.environ.get('TWELVEDATA_API_KEY')
+
 SYMBOLS = os.getenv('SYMBOLS', 'EURUSD,GBPUSD,USDJPY').split(',') 
-BUY_THRESHOLD = float(os.getenv('BUY_THRESHOLD', '0.7'))  # 70% confidence
-SELL_THRESHOLD = float(os.getenv('SELL_THRESHOLD', '0.3'))  # 30% confidence
+BUY_THRESHOLD = float(os.getenv('BUY_THRESHOLD', '0.7'))
+SELL_THRESHOLD = float(os.getenv('SELL_THRESHOLD', '0.3'))
 TIMEFRAME = os.getenv('TIMEFRAME', '5min')
 
 # ======================
@@ -40,15 +39,23 @@ class ForexDataFetcher:
         params = {
             "symbol": symbol,
             "interval": TIMEFRAME,
-            "outputsize": days*288,  # 288 5-min candles/day
+            "outputsize": days*288,
             "apikey": TWELVEDATA_API_KEY
         }
-        response = requests.get(f"{self.base_url}/time_series", params=params)
-        data = response.json()['values']
-        df = pd.DataFrame(data)
-        df['datetime'] = pd.to_datetime(df['datetime'])
-        df.set_index('datetime', inplace=True)
-        return df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+        try:
+            response = requests.get(f"{self.base_url}/time_series", params=params)
+            response.raise_for_status()
+            data = response.json()
+            if 'values' not in data:
+                print(f"⚠️ No 'values' in API response for {symbol}")
+                return None
+            df = pd.DataFrame(data['values'])
+            df['datetime'] = pd.to_datetime(df['datetime'])
+            df.set_index('datetime', inplace=True)
+            return df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+        except Exception as e:
+            print(f"⚠️ Error fetching data for {symbol}: {str(e)}")
+            return None
     
     def get_live_data(self, symbol, lookback=50):
         """Get latest candles for prediction"""
@@ -58,11 +65,19 @@ class ForexDataFetcher:
             "outputsize": lookback,
             "apikey": TWELVEDATA_API_KEY
         }
-        response = requests.get(f"{self.base_url}/time_series", params=params)
-        data = response.json()['values']
-        df = pd.DataFrame(data)
-        df.set_index('datetime', inplace=True)
-        return df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+        try:
+            response = requests.get(f"{self.base_url}/time_series", params=params)
+            response.raise_for_status()
+            data = response.json()
+            if 'values' not in data:
+                print(f"⚠️ No 'values' in API response for {symbol}")
+                return None
+            df = pd.DataFrame(data['values'])
+            df.set_index('datetime', inplace=True)
+            return df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+        except Exception as e:
+            print(f"⚠️ Error fetching live data for {symbol}: {str(e)}")
+            return None
 
 # ======================
 # 3. MODEL CACHING SYSTEM
@@ -75,46 +90,50 @@ class ModelCache:
     
     def load_or_train(self, symbol, data):
         """Load cached model or train new one"""
+        if data is None:
+            return None, None
+            
         model_path = f"models/{symbol}_model.h5"
         scaler_path = f"models/{symbol}_scaler.pkl"
         
         if os.path.exists(model_path) and os.path.exists(scaler_path):
-            model = load_model(model_path)
-            with open(scaler_path, 'rb') as f:
-                scaler = pickle.load(f)
-            print(f"♻️ Loaded cached model for {symbol}")
+            try:
+                model = load_model(model_path)
+                with open(scaler_path, 'rb') as f:
+                    scaler = pickle.load(f)
+                print(f"♻️ Loaded cached model for {symbol}")
+                return model, scaler
+            except Exception as e:
+                print(f"⚠️ Error loading model for {symbol}: {str(e)}")
+                return self._train_new_model(data)
         else:
-            print(f"🛠️ Training new model for {symbol}")
-            model, scaler = self._train_new_model(data)
-            model.save(model_path)
-            with open(scaler_path, 'wb') as f:
-                pickle.dump(scaler, f)
-        
-        self.models[symbol] = model
-        self.scalers[symbol] = scaler
-        return model, scaler
+            return self._train_new_model(data)
     
     def _train_new_model(self, data):
         """Train fresh model"""
-        scaler = MinMaxScaler()
-        scaled_data = scaler.fit_transform(data)
-        
-        X, y = [], []
-        for i in range(30, len(scaled_data)):
-            X.append(scaled_data[i-30:i])
-            y.append(1 if scaled_data[i, 3] > scaled_data[i-1, 3] else 0)
-        
-        model = Sequential([
-            LSTM(64, return_sequences=True, input_shape=(30, 5)),
-            Dropout(0.2),
-            LSTM(32),
-            Dropout(0.2),
-            Dense(1, activation='sigmoid')
-        ])
-        
-        model.compile(optimizer='adam', loss='binary_crossentropy')
-        model.fit(np.array(X), np.array(y), epochs=10, batch_size=32, verbose=0)
-        return model, scaler
+        try:
+            scaler = MinMaxScaler()
+            scaled_data = scaler.fit_transform(data)
+            
+            X, y = [], []
+            for i in range(30, len(scaled_data)):
+                X.append(scaled_data[i-30:i])
+                y.append(1 if scaled_data[i, 3] > scaled_data[i-1, 3] else 0)
+            
+            model = Sequential([
+                LSTM(64, return_sequences=True, input_shape=(30, 5)),
+                Dropout(0.2),
+                LSTM(32),
+                Dropout(0.2),
+                Dense(1, activation='sigmoid')
+            ])
+            
+            model.compile(optimizer='adam', loss='binary_crossentropy')
+            model.fit(np.array(X), np.array(y), epochs=10, batch_size=32, verbose=0)
+            return model, scaler
+        except Exception as e:
+            print(f"⚠️ Error training model: {str(e)}")
+            return None, None
 
 # ======================
 # 4. SIGNAL GENERATOR
@@ -131,11 +150,17 @@ class SignalGenerator:
         for symbol in SYMBOLS:
             try:
                 # Get model and data
-                model, scaler = self.cache.load_or_train(
-                    symbol,
-                    self.data_fetcher.get_historical_data(symbol)
-                )
+                hist_data = self.data_fetcher.get_historical_data(symbol)
+                if hist_data is None:
+                    continue
+                    
+                model, scaler = self.cache.load_or_train(symbol, hist_data)
+                if model is None or scaler is None:
+                    continue
+                
                 live_data = self.data_fetcher.get_live_data(symbol)
+                if live_data is None:
+                    continue
                 
                 # Prepare prediction
                 scaled_data = scaler.transform(live_data)
@@ -166,29 +191,34 @@ class SignalGenerator:
         
         return signals
     
-    def send_signals(self, signals):
+    async def send_signals(self, signals):
         """Send formatted alerts via Telegram"""
         if not signals or not self.bot:
             return
             
         for signal in signals:
-            emoji = "🚀" if signal['direction'] == "BUY" else "📉"
-            self.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=f"""
+            try:
+                emoji = "🚀" if signal['direction'] == "BUY" else "📉"
+                await self.bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=f"""
 {emoji} *{signal['symbol']} {signal['direction']} Signal*
 ━━━━━━━━━━━━━━
 • Confidence: `{signal['confidence']*100:.1f}%`
 • Price: `{signal['price']:.5f}`
 • Time: `{datetime.now().strftime("%H:%M:%S")}`
 """,
-                parse_mode='Markdown'
-            )
+                    parse_mode='Markdown'
+                )
+            except TelegramError as e:
+                print(f"⚠️ Telegram Error: {str(e)}")
+            except Exception as e:
+                print(f"⚠️ Unexpected Error sending message: {str(e)}")
 
 # ======================
 # 5. MAIN EXECUTION
 # ======================
-if __name__ == "__main__":
+async def main():
     print("""
     ███████╗ ██████╗ ██████╗ ███████╗██╗  ██╗
     ██╔════╝██╔═══██╗██╔══██╗██╔════╝╚██╗██╔╝
@@ -204,18 +234,20 @@ if __name__ == "__main__":
     if not os.path.exists('models'):
         print("⚙️ Training models for all symbols...")
         for symbol in SYMBOLS:
-            bot.cache.load_or_train(
-                symbol,
-                bot.data_fetcher.get_historical_data(symbol)
-            )
+            hist_data = bot.data_fetcher.get_historical_data(symbol)
+            if hist_data is not None:
+                bot.cache.load_or_train(symbol, hist_data)
     
     # Main loop
     print("🔍 Starting signal monitoring...")
     while True:
         try:
             signals = bot.generate_signals()
-            bot.send_signals(signals)
-            time.sleep(180)  # Check every 3 minutes
+            await bot.send_signals(signals)
+            await asyncio.sleep(180)  # Check every 3 minutes
         except Exception as e:
             print(f"⚠️ Error in main loop: {str(e)}")
-            time.sleep(60)
+            await asyncio.sleep(60)
+
+if __name__ == "__main__":
+    asyncio.run(main())
