@@ -5,56 +5,53 @@ import numpy as np
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from sklearn.preprocessing import MinMaxScaler
-from telegram import Bot, TelegramError
+from telegram import Bot, ParseMode
 import time
 from datetime import datetime
 import pickle
 from dotenv import load_dotenv
 
 # ======================
-# 1. ENHANCED CONFIGURATION
+# 1. CONFIGURATION
 # ======================
 load_dotenv()
 
-def validate_config():
-    """Validate all required configurations"""
-    configs = {
-        'TELEGRAM_TOKEN': os.getenv('TELEGRAM_TOKEN'),
-        'TELEGRAM_CHAT_ID': os.getenv('TELEGRAM_CHAT_ID'),
-        'TWELVEDATA_API_KEY': os.getenv('TWELVEDATA_API_KEY')
-    }
-    
-    print("\n🔍 Configuration Check:")
-    for key, value in configs.items():
-        if not value:
-            print(f"❌ Missing: {key}")
-        else:
-            print(f"✅ Found: {key}")
-    
-    return configs
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+TWELVEDATA_API_KEY = os.getenv('TWELVEDATA_API_KEY')
 
-config = validate_config()
+# Validate configuration
+print("\n🔍 Configuration Check:")
+print(f"TELEGRAM_TOKEN: {'*****' if TELEGRAM_TOKEN else 'NOT FOUND'}")
+print(f"TELEGRAM_CHAT_ID: {TELEGRAM_CHAT_ID or 'NOT FOUND'}")
+print(f"TWELVEDATA_API_KEY: {'*****' if TWELVEDATA_API_KEY else 'NOT FOUND'}")
 
-TELEGRAM_TOKEN = config['TELEGRAM_TOKEN']
-TELEGRAM_CHAT_ID = config['TELEGRAM_CHAT_ID']
-TWELVEDATA_API_KEY = config['TWELVEDATA_API_KEY']
-
-# Customizable from .env
-SYMBOLS = os.getenv('SYMBOLS', 'EUR/USD,GBP/USD,USD/JPY').split(',')
+SYMBOLS = os.getenv('SYMBOLS', 'EUR/USD').split(',')  # Single symbol for API limits
 BUY_THRESHOLD = float(os.getenv('BUY_THRESHOLD', '0.7'))
 SELL_THRESHOLD = float(os.getenv('SELL_THRESHOLD', '0.3'))
-TIMEFRAME = os.getenv('TIMEFRAME', '5min')
+TIMEFRAME = os.getenv('TIMEFRAME', '30min')  # Higher timeframe
+CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '1800'))  # 30 minutes
 
 # ======================
-# 2. ENHANCED DATA FETCHER
+# 2. API-CONSCIOUS DATA FETCHER
 # ======================
 class ForexDataFetcher:
     def __init__(self):
         self.base_url = "https://api.twelvedata.com"
-        self.session = requests.Session()
+        self.last_request = 0
         
-    def _make_request(self, symbol, lookback):
-        """Centralized request handler with error checking"""
+    def _rate_limit(self):
+        """Enforce strict rate limiting"""
+        now = time.time()
+        elapsed = now - self.last_request
+        if elapsed < 7.5:  # 8 requests/minute (free tier limit)
+            time.sleep(7.5 - elapsed)
+        self.last_request = time.time()
+        
+    def get_data(self, symbol, lookback):
+        """Safe data fetcher with rate limiting"""
+        self._rate_limit()
+        
         params = {
             "symbol": symbol,
             "interval": TIMEFRAME,
@@ -63,13 +60,15 @@ class ForexDataFetcher:
         }
         
         try:
-            response = self.session.get(f"{self.base_url}/time_series", params=params, timeout=10)
+            response = requests.get(f"{self.base_url}/time_series", params=params, timeout=15)
             response.raise_for_status()
             data = response.json()
             
+            if 'code' in data and data['code'] == 429:
+                raise ValueError(f"API Limit: {data.get('message', 'Daily limit reached')}")
+                
             if 'values' not in data:
-                print(f"⚠️ No 'values' in API response for {symbol}. Full response: {data}")
-                return None
+                raise ValueError(f"No market data in response")
                 
             return data['values']
             
@@ -77,9 +76,14 @@ class ForexDataFetcher:
             print(f"🚨 API Error for {symbol}: {str(e)}")
             return None
 
-    def get_historical_data(self, symbol, days=30):
-        """Get historical data with robust error handling"""
-        data = self._make_request(symbol, days*288)
+    def get_historical_data(self, symbol, days=5):  # Reduced history
+        return self._process_data(self.get_data(symbol, days*48))  # 48 candles/day for 30min
+        
+    def get_live_data(self, symbol, lookback=24):  # Reduced lookback (~12 hours)
+        return self._process_data(self.get_data(symbol, lookback))
+        
+    def _process_data(self, data):
+        """Convert API data to DataFrame"""
         if not data:
             return None
             
@@ -89,26 +93,20 @@ class ForexDataFetcher:
             df.set_index('datetime', inplace=True)
             return df[['open', 'high', 'low', 'close', 'volume']].astype(float)
         except Exception as e:
-            print(f"📊 Data processing error for {symbol}: {str(e)}")
+            print(f"📊 Data processing error: {str(e)}")
             return None
 
-    def get_live_data(self, symbol, lookback=50):
-        """Get live market data"""
-        return self.get_historical_data(symbol, lookback)
-
 # ======================
-# 3. MODEL CACHING SYSTEM
+# 3. MODEL MANAGER
 # ======================
-class ModelCache:
+class ModelManager:
     def __init__(self):
         os.makedirs('models', exist_ok=True)
-        self.scalers = {}
-        self.models = {}
-    
-    def load_or_train(self, symbol, data):
-        """Improved model loading with validation"""
-        if data is None:
-            print(f"⚠️ No data available for {symbol}")
+        
+    def get_model(self, symbol, data):
+        """Get or create model with validation"""
+        if data is None or len(data) < 50:
+            print(f"⚠️ Insufficient data for {symbol}")
             return None, None
             
         model_path = f"models/{symbol.replace('/', '_')}_model.h5"
@@ -116,28 +114,23 @@ class ModelCache:
         
         try:
             if os.path.exists(model_path) and os.path.exists(scaler_path):
-                model = load_model(model_path)
-                with open(scaler_path, 'rb') as f:
-                    scaler = pickle.load(f)
-                print(f"♻️ Loaded cached model for {symbol}")
-                return model, scaler
+                return load_model(model_path), self._load_scaler(scaler_path)
         except Exception as e:
-            print(f"⚠️ Error loading cached model for {symbol}: {str(e)}")
+            print(f"⚠️ Model load error: {str(e)}")
             
-        print(f"🛠️ Training new model for {symbol}")
-        return self._train_new_model(data)
-
-    def _train_new_model(self, data):
-        """Enhanced model training"""
+        return self._train_model(data, model_path, scaler_path)
+        
+    def _train_model(self, data, model_path, scaler_path):
+        """Train new model with error handling"""
         try:
             scaler = MinMaxScaler()
-            scaled_data = scaler.fit_transform(data)
+            scaled = scaler.fit_transform(data)
             
             X, y = [], []
-            for i in range(30, len(scaled_data)):
-                X.append(scaled_data[i-30:i])
-                y.append(1 if scaled_data[i, 3] > scaled_data[i-1, 3] else 0)
-            
+            for i in range(30, len(scaled)):
+                X.append(scaled[i-30:i])
+                y.append(1 if scaled[i, 3] > scaled[i-1, 3] else 0)
+                
             model = Sequential([
                 LSTM(32, return_sequences=True, input_shape=(30, 5)),
                 Dropout(0.2),
@@ -146,171 +139,146 @@ class ModelCache:
                 Dense(1, activation='sigmoid')
             ])
             
-            model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-            model.fit(np.array(X), np.array(y), epochs=10, batch_size=32, verbose=0)
+            model.compile(optimizer='adam', loss='binary_crossentropy')
+            model.fit(np.array(X), np.array(y), epochs=8, batch_size=16, verbose=0)
             
+            model.save(model_path)
+            with open(scaler_path, 'wb') as f:
+                pickle.dump(scaler, f)
+                
             return model, scaler
+            
         except Exception as e:
             print(f"🚨 Model training failed: {str(e)}")
             return None, None
+            
+    def _load_scaler(self, path):
+        with open(path, 'rb') as f:
+            return pickle.load(f)
 
 # ======================
-# 4. ROBUST SIGNAL GENERATOR
+# 4. SIGNAL PROCESSOR
 # ======================
-class SignalGenerator:
+class SignalProcessor:
     def __init__(self):
-        self.data_fetcher = ForexDataFetcher()
-        self.cache = ModelCache()
-        self.bot = self._init_telegram()
+        self.fetcher = ForexDataFetcher()
+        self.models = ModelManager()
+        self.bot = self._init_bot()
         
-    def _init_telegram(self):
-        """Initialize Telegram bot with verification"""
+    def _init_bot(self):
+        """Initialize Telegram bot safely"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            print("⚠️ Telegram credentials not configured")
             return None
             
         try:
             bot = Bot(token=TELEGRAM_TOKEN)
-            # Verify bot can send messages
-            test_msg = "🤖 Forex Bot Initialized Successfully\n" \
-                     f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=test_msg)
-            print("✅ Telegram connection verified")
+            bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=f"✅ Bot Started at {datetime.now().strftime('%H:%M:%S')}",
+                parse_mode=ParseMode.MARKDOWN
+            )
             return bot
-        except TelegramError as e:
-            print(f"🚨 Telegram initialization failed: {str(e)}")
-            return None
         except Exception as e:
-            print(f"🚨 Unexpected Telegram error: {str(e)}")
+            print(f"⚠️ Telegram init failed: {str(e)}")
             return None
-
-    def generate_signals(self):
-        """Enhanced signal generation"""
-        signals = []
-        
-        for symbol in SYMBOLS:
-            try:
-                print(f"\n🔎 Processing {symbol}...")
+            
+    def process_symbol(self, symbol):
+        """Full processing pipeline for one symbol"""
+        try:
+            print(f"\n🔎 Processing {symbol}...")
+            
+            # Get data
+            hist_data = self.fetcher.get_historical_data(symbol)
+            live_data = self.fetcher.get_live_data(symbol)
+            
+            if hist_data is None or live_data is None:
+                return None
                 
-                # Get data
-                hist_data = self.data_fetcher.get_historical_data(symbol)
-                live_data = self.data_fetcher.get_live_data(symbol)
+            # Get model
+            model, scaler = self.models.get_model(symbol, hist_data)
+            if model is None or scaler is None:
+                return None
                 
-                if hist_data is None or live_data is None:
-                    print(f"⚠️ Skipping {symbol} due to data issues")
-                    continue
-                
-                # Get model
-                model, scaler = self.cache.load_or_train(symbol, hist_data)
-                if model is None or scaler is None:
-                    continue
-                
-                # Prepare prediction
-                scaled_data = scaler.transform(live_data)
-                X = np.array([scaled_data[-30:]])
-                
-                # Predict
-                prediction = model.predict(X, verbose=0)[0][0]
-                price = live_data['close'].iloc[-1]
-                
-                print(f"📊 {symbol} - Price: {price:.5f}, Prediction: {prediction:.2%}")
-                
-                # Generate signal
-                if prediction >= BUY_THRESHOLD:
-                    signals.append({
-                        'symbol': symbol,
-                        'direction': "BUY",
-                        'confidence': float(prediction),
-                        'price': float(price)
-                    })
-                elif prediction <= SELL_THRESHOLD:
-                    signals.append({
-                        'symbol': symbol,
-                        'direction': "SELL", 
-                        'confidence': float(1 - prediction),
-                        'price': float(price)
-                    })
-                    
-            except Exception as e:
-                print(f"⚠️ Error processing {symbol}: {str(e)}")
-                continue
-                
-        return signals
-    
-    def send_signals(self, signals):
-        """Reliable signal sending with rich formatting"""
-        if not self.bot:
-            print("⚠️ Cannot send signals - Telegram not initialized")
+            # Predict
+            scaled = scaler.transform(live_data)
+            prediction = model.predict(np.array([scaled[-30:]]), verbose=0)[0][0]
+            price = live_data['close'].iloc[-1]
+            
+            print(f"📊 Prediction: {prediction:.2%} at {price:.5f}")
+            
+            # Generate signal
+            if prediction >= BUY_THRESHOLD:
+                return {'symbol': symbol, 'direction': 'BUY', 
+                        'confidence': prediction, 'price': price}
+            elif prediction <= SELL_THRESHOLD:
+                return {'symbol': symbol, 'direction': 'SELL',
+                        'confidence': 1-prediction, 'price': price}
+                        
+        except Exception as e:
+            print(f"⚠️ Processing error: {str(e)}")
+            return None
+            
+    def send_signal(self, signal):
+        """Send formatted signal to Telegram"""
+        if not self.bot or not signal:
             return
             
-        if not signals:
-            print("🔍 No signals to send")
-            return
-            
-        print(f"\n📨 Sending {len(signals)} signals to Telegram...")
-        
-        for signal in signals:
-            try:
-                emoji = "🚀" if signal['direction'] == "BUY" else "📉"
-                message = (
-                    f"{emoji} *{signal['symbol']} {signal['direction']} Signal*\n"
-                    f"━━━━━━━━━━━━━━\n"
-                    f"• Confidence: `{signal['confidence']*100:.1f}%`\n"
-                    f"• Price: `{signal['price']:.5f}`\n"
-                    f"• Time: `{datetime.now().strftime('%H:%M:%S')}`"
-                )
-                
-                self.bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=message,
-                    parse_mode='Markdown'
-                )
-                print(f"✅ Sent {signal['symbol']} {signal['direction']} signal")
-                
-            except Exception as e:
-                print(f"⚠️ Failed to send {signal['symbol']} signal: {str(e)}")
+        try:
+            emoji = "🚀" if signal['direction'] == 'BUY' else "📉"
+            self.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=f"""
+{emoji} *{signal['symbol']} {signal['direction']} Signal*
+━━━━━━━━━━━━━━
+• Confidence: `{signal['confidence']*100:.1f}%`
+• Price: `{signal['price']:.5f}`
+• Time: `{datetime.now().strftime('%H:%M:%S')}`
+""",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            print(f"⚠️ Telegram send failed: {str(e)}")
 
 # ======================
 # 5. MAIN EXECUTION
 # ======================
 if __name__ == "__main__":
-    print("\n" + "="*50)
-    print("💹 FOREX SIGNAL BOT - ENHANCED DEBUG VERSION")
-    print("="*50 + "\n")
+    print("\n" + "="*40)
+    print("💹 FOREX SIGNAL BOT - STABLE VERSION")
+    print("="*40 + "\n")
     
-    # Initial checks
     if not TWELVEDATA_API_KEY:
-        print("❌ CRITICAL: No TwelveData API Key found")
+        print("❌ Error: Missing API Key")
         exit(1)
         
-    bot = SignalGenerator()
+    processor = SignalProcessor()
     
-    # First-time setup
+    # Initial training if needed
     if not os.path.exists('models'):
         print("\n⚙️ Initial model training...")
         for symbol in SYMBOLS:
-            print(f"🛠️ Training model for {symbol}")
-            data = bot.data_fetcher.get_historical_data(symbol)
+            data = processor.fetcher.get_historical_data(symbol)
             if data is not None:
-                bot.cache.load_or_train(symbol, data)
+                processor.models.get_model(symbol, data)
     
     # Main loop
-    print("\n🔍 Starting signal monitoring...")
+    print("\n🔍 Starting monitoring...")
     while True:
         try:
-            print("\n" + "-"*50)
-            print(f"🔄 Cycle started at {datetime.now().strftime('%H:%M:%S')}")
+            print("\n" + "-"*40)
+            print(f"⏳ Cycle at {datetime.now().strftime('%H:%M:%S')}")
             
-            signals = bot.generate_signals()
-            bot.send_signals(signals)
-            
-            print(f"⏳ Next check in 3 minutes...")
-            time.sleep(180)
+            for symbol in SYMBOLS:
+                signal = processor.process_symbol(symbol)
+                processor.send_signal(signal)
+                
+            print(f"\n🕒 Next check in {CHECK_INTERVAL//60} minutes...")
+            time.sleep(CHECK_INTERVAL)
             
         except KeyboardInterrupt:
             print("\n🛑 Bot stopped by user")
             break
         except Exception as e:
-            print(f"⚠️ Unexpected error in main loop: {str(e)}")
-            print("🔄 Retrying in 1 minute...")
-            time.sleep(60)
+            print(f"⚠️ Critical error: {str(e)}")
+            print("🔄 Restarting in 5 minutes...")
+            time.sleep(300)
