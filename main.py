@@ -1,9 +1,12 @@
 import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Force CPU-only mode
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Reduce TensorFlow verbosity
+
 import requests
 import pandas as pd
 import numpy as np
 from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
 from sklearn.preprocessing import MinMaxScaler
 from telegram import Bot, ParseMode
 import time
@@ -18,7 +21,7 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 TWELVEDATA_API_KEY = os.getenv('TWELVEDATA_API_KEY')
 
-SYMBOLS = ['EUR/USD', 'GBP/USD']  # Correct format with forward slash
+SYMBOLS = ['EUR/USD', 'GBP/USD']
 BUY_THRESHOLD = 0.65
 SELL_THRESHOLD = 0.35
 TIMEFRAME = '15min'
@@ -48,7 +51,7 @@ class ForexDataFetcher:
             "interval": TIMEFRAME,
             "outputsize": lookback,
             "apikey": TWELVEDATA_API_KEY,
-            "type": "forex"  # Specify forex data type
+            "type": "forex"
         }
         
         try:
@@ -60,6 +63,7 @@ class ForexDataFetcher:
                 raise ValueError(f"API Limit: {data.get('message', 'Rate limit exceeded')}")
                 
             if 'values' not in data:
+                print(f"API Response: {data}")  # Debug output
                 raise ValueError(f"No price data in response for {symbol}")
                 
             return data['values']
@@ -70,31 +74,37 @@ class ForexDataFetcher:
             
     def _process_data(self, data):
         """Convert API data to DataFrame with volume handling"""
+        if not data:
+            raise ValueError("No data received from API")
+        
         try:
             df = pd.DataFrame(data)
+            print(f"Raw data columns: {df.columns}")  # Debug output
+            
+            required_cols = ['open', 'high', 'low', 'close']
+            if not all(col in df.columns for col in required_cols):
+                raise ValueError(f"Missing required columns. Expected: {required_cols}")
+            
             df['datetime'] = pd.to_datetime(df['datetime'])
             df.set_index('datetime', inplace=True)
             
-            # Standard columns we always expect
-            base_cols = ['open', 'high', 'low', 'close']
-            
             # Add volume if available, otherwise create zero-filled column
             if 'volume' in df.columns:
-                return df[base_cols + ['volume']].astype(float)
+                return df[required_cols + ['volume']].astype(float)
             else:
-                df['volume'] = 0  # Add volume column with zeros
-                return df[base_cols + ['volume']].astype(float)
+                df['volume'] = 0
+                return df[required_cols + ['volume']].astype(float)
                 
         except Exception as e:
             print(f"📊 Data processing error: {str(e)}")
             return pd.DataFrame()
 
-    def get_historical_data(self, symbol, days=7):
+    def get_historical_data(self, symbol, days=14):  # Increased from 7 to 14 days
         """Get historical data for training"""
         data = self._fetch_data(symbol, days*96)  # 96 candles/day for 15min
         return self._process_data(data) if data else pd.DataFrame()
         
-    def get_live_data(self, symbol, lookback=24):
+    def get_live_data(self, symbol, lookback=48):  # Increased from 24 to 48 periods
         """Get recent data for prediction"""
         data = self._fetch_data(symbol, lookback)
         return self._process_data(data) if data else pd.DataFrame()
@@ -110,7 +120,7 @@ class ModelManager:
             return None, None
             
         model_key = symbol.replace('/', '_')
-        model_path = f"models/{model_key}_model.h5"
+        model_path = f"models/{model_key}_model.keras"  # Changed to .keras format
         scaler_path = f"models/{model_key}_scaler.pkl"
         
         try:
@@ -134,7 +144,8 @@ class ModelManager:
                 y.append(1 if scaled[i, 3] > scaled[i-1, 3] else 0)  # 3 = close price index
                 
             model = Sequential([
-                LSTM(32, return_sequences=True, input_shape=(30, 5)),  # 5 features
+                Input(shape=(30, 5)),  # Added Input layer
+                LSTM(32, return_sequences=True),
                 Dropout(0.2),
                 LSTM(16),
                 Dropout(0.2),
@@ -142,9 +153,12 @@ class ModelManager:
             ])
             
             model.compile(optimizer='adam', loss='binary_crossentropy')
-            model.fit(np.array(X), np.array(y), epochs=8, batch_size=16, verbose=0)
+            model.fit(np.array(X), np.array(y), 
+                     epochs=8, 
+                     batch_size=8,  # Reduced from 16 to 8 for Codespace memory
+                     verbose=0)
             
-            model.save(model_path)
+            model.save(model_path)  # Uses new .keras format
             with open(scaler_path, 'wb') as f:
                 pickle.dump(scaler, f)
                 
@@ -174,7 +188,7 @@ class SignalProcessor:
             bot = Bot(token=TELEGRAM_TOKEN)
             bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
-                text=f"✅ Bot Started at {datetime.now().strftime('%H:%M:%S')}",
+                text=f"✅ Bot Restarted at {datetime.now().strftime('%H:%M:%S')}",
                 parse_mode=ParseMode.MARKDOWN
             )
             return bot
@@ -187,9 +201,9 @@ class SignalProcessor:
         try:
             print(f"\n🔎 Processing {symbol}...")
             
-            # Get data
-            hist_data = self.fetcher.get_historical_data(symbol)
-            live_data = self.fetcher.get_live_data(symbol)
+            # Get data with increased lookback periods
+            hist_data = self.fetcher.get_historical_data(symbol, days=14)
+            live_data = self.fetcher.get_live_data(symbol, lookback=48)
             
             if hist_data.empty or live_data.empty:
                 print(f"⚠️ Missing data for {symbol}")
@@ -255,7 +269,7 @@ class SignalProcessor:
 
 if __name__ == "__main__":
     print("\n" + "="*50)
-    print("💹 FOREX SIGNAL BOT - FINAL WORKING VERSION")
+    print("💹 FOREX SIGNAL BOT - UPDATED VERSION")
     print("="*50 + "\n")
     
     processor = SignalProcessor()
@@ -264,7 +278,7 @@ if __name__ == "__main__":
     if not os.path.exists('models'):
         print("\n⚙️ Initial model training...")
         for symbol in SYMBOLS:
-            data = processor.fetcher.get_historical_data(symbol)
+            data = processor.fetcher.get_historical_data(symbol, days=14)
             if not data.empty:
                 processor.models.get_model(symbol, data)
     
